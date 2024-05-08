@@ -4,8 +4,10 @@ from django.db import transaction
 from django.db.models import Q
 from django.http import JsonResponse
 from django.middleware.csrf import get_token
+from django.shortcuts import get_object_or_404
 from rest_framework import status, generics, permissions, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import NotFound
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -90,8 +92,33 @@ class TransactionViewSet(viewsets.ViewSet):
         serializer = TransactionSerializer(user_transactions, many=True)
         return Response(serializer.data)
 
+    @action(detail=False, methods=['get'], url_path='transactions_account')
+    def transactions_account(self, request):
+        """
+        Возвращает список транзакций для заданного номера счета account_number.
+        """
+        account_number = request.query_params.get('account_number')
+        if not account_number:
+            raise NotFound("Account number must be provided.")
+
+
+        try:
+            account_number = int(account_number)
+        except ValueError:
+            raise NotFound("Account number must be a valid number.")
+
+        account = get_object_or_404(Account, account_number=account_number, user=request.user)
+        transactions = Transaction.objects.filter(
+            Q(from_account=account) | Q(to_account=account)
+        ).order_by('-date')
+        serializer = TransactionSerializer(transactions, many=True)
+        return Response(serializer.data)
+
     @action(detail=False, methods=['get'])
     def last_transactions(self, request):
+        """
+               Возвращает последние 5 транзакций
+               """
         user = self.request.user
         user_transactions = Transaction.objects.filter(
             Q(from_account__user=user) | Q(to_account__user=user)
@@ -101,6 +128,9 @@ class TransactionViewSet(viewsets.ViewSet):
         return Response(serializer.data)
 
     def create(self, request):
+        """
+                      Создает из 1 транзакции две Deposit/Withdrawal
+                       """
         serializer = TransactionSerializer(data=request.data)
         if serializer.is_valid():
             transaction_data = serializer.validated_data
@@ -111,7 +141,7 @@ class TransactionViewSet(viewsets.ViewSet):
             from_account = Account.objects.get(account_number=from_account_number.account_number)
             to_account = Account.objects.get(account_number=to_account_number.account_number)
 
-            if from_account.user != self.request.user:
+            if from_account.user != self.request.user or to_account==from_account:
                 return Response({'error': 'You do not have permission to perform this action'},
                                 status=status.HTTP_403_FORBIDDEN)
 
@@ -131,7 +161,6 @@ class TransactionViewSet(viewsets.ViewSet):
                     internal=internal,
                     from_account=from_account
                 )
-
 
                 to_account.balance += amount
                 to_account.save()
