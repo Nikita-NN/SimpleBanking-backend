@@ -1,3 +1,4 @@
+import random
 from io import BytesIO
 
 from django.contrib.auth import authenticate, login as auth_login, logout
@@ -5,17 +6,18 @@ from django.contrib.auth.hashers import make_password
 from django.db import transaction, connection
 from django.http import JsonResponse, HttpResponse
 from django.middleware.csrf import get_token
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
 from rest_framework import status, generics, permissions, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from reportlab.lib.pagesizes import letter
-from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle , Paragraph
-from reportlab.lib.styles import getSampleStyleSheet
-from .models import User, Account, Transaction
+
+from .models import User, Transaction
 from .serializers import UserSerializer, AccountSerializer, TransactionSerializer
 
 
@@ -84,15 +86,45 @@ class AccountViewSet(viewsets.ModelViewSet):
             accounts = [dict(zip([column[0] for column in cursor.description], row)) for row in rows]
         return accounts
 
+    @staticmethod
+    def generate_account_number():
+        return ''.join([str(random.randint(0, 9)) for _ in range(8)])
+
+    def destroy(self, request, *args, **kwargs):
+        account_id = kwargs.get('pk')
+        user_id = self.request.user.id
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT id FROM banking_account WHERE id = %s AND user_id = %s",
+                [account_id, user_id]
+            )
+            account = cursor.fetchone()
+            if not account:
+                return Response({"error": "Account not found or permission denied"}, status=status.HTTP_404_NOT_FOUND)
+
+            cursor.execute(
+                "DELETE FROM banking_transaction WHERE from_account_id = %s OR to_account_id = %s",
+                [account_id, account_id]
+            )
+
+            cursor.execute(
+                "DELETE FROM banking_account WHERE id = %s",
+                [account_id]
+            )
+        return Response({"success": "Account and related transactions deleted successfully"},
+                        status=status.HTTP_204_NO_CONTENT)
+
     def perform_create(self, serializer):
         user_id = self.request.user.id
         account_data = serializer.validated_data
+        account_number = self.generate_account_number()
+
         with connection.cursor() as cursor:
             cursor.execute(
                 "INSERT INTO banking_account (name, balance, type, account_number, user_id) VALUES (%s, %s, %s, %s, %s)",
-                [account_data['name'], account_data['balance'], account_data['type'], account_data['account_number'], user_id]
+                [account_data['name'], 0, account_data['type'], account_number, user_id]
             )
-
 
 
 class TransactionViewSet(viewsets.ViewSet):
@@ -176,7 +208,7 @@ class TransactionViewSet(viewsets.ViewSet):
         response = HttpResponse(buffer, content_type='application/pdf')
         response['Content-Disposition'] = 'attachment; filename="transaction_statement.pdf"'
         return response
-    
+
     @action(detail=False, methods=['get'], url_path='transactions_account')
     def transactions_account(self, request):
         account_number = request.query_params.get('account_number')
@@ -229,14 +261,17 @@ class TransactionViewSet(viewsets.ViewSet):
             to_account_number = transaction_data.get('to_account').account_number
 
             with connection.cursor() as cursor:
-                cursor.execute("SELECT id, balance, user_id FROM banking_account WHERE account_number = %s", [from_account_number])
+                cursor.execute("SELECT id, balance, user_id FROM banking_account WHERE account_number = %s",
+                               [from_account_number])
                 from_account = cursor.fetchone()
 
-                cursor.execute("SELECT id, balance, user_id FROM banking_account WHERE account_number = %s", [to_account_number])
+                cursor.execute("SELECT id, balance, user_id FROM banking_account WHERE account_number = %s",
+                               [to_account_number])
                 to_account = cursor.fetchone()
 
                 if from_account[2] != self.request.user.id or from_account == to_account:
-                    return Response({'error': 'You do not have permission to perform this action'}, status=status.HTTP_403_FORBIDDEN)
+                    return Response({'error': 'You do not have permission to perform this action'},
+                                    status=status.HTTP_403_FORBIDDEN)
 
                 if from_account[1] < amount:
                     return Response({"error": "Insufficient funds."}, status=status.HTTP_400_BAD_REQUEST)
@@ -244,14 +279,16 @@ class TransactionViewSet(viewsets.ViewSet):
                 internal = from_account[2] == to_account[2]
 
                 with transaction.atomic():
-                    cursor.execute("UPDATE banking_account SET balance = balance - %s WHERE id = %s", [amount, from_account[0]])
+                    cursor.execute("UPDATE banking_account SET balance = balance - %s WHERE id = %s",
+                                   [amount, from_account[0]])
                     cursor.execute("""
                         INSERT INTO banking_transaction 
                         (amount, transaction_type, description, internal, from_account_id, date) 
                         VALUES (%s, 'withdrawal', %s, %s, %s, CURRENT_TIMESTAMP)
                     """, [amount, transaction_data.get('description'), internal, from_account[0]])
 
-                    cursor.execute("UPDATE banking_account SET balance = balance + %s WHERE id = %s", [amount, to_account[0]])
+                    cursor.execute("UPDATE banking_account SET balance = balance + %s WHERE id = %s",
+                                   [amount, to_account[0]])
                     cursor.execute("""
                         INSERT INTO banking_transaction 
                         (amount, transaction_type, description, internal, to_account_id, date) 
