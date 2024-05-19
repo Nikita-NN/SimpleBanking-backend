@@ -1,17 +1,20 @@
+from io import BytesIO
+
 from django.contrib.auth import authenticate, login as auth_login, logout
 from django.contrib.auth.hashers import make_password
-from django.db import transaction
-from django.db.models import Q
-from django.http import JsonResponse
+from django.db import transaction, connection
+from django.http import JsonResponse, HttpResponse
 from django.middleware.csrf import get_token
-from django.shortcuts import get_object_or_404
 from rest_framework import status, generics, permissions, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle , Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
 from .models import User, Account, Transaction
 from .serializers import UserSerializer, AccountSerializer, TransactionSerializer
 
@@ -74,107 +77,187 @@ class AccountViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        return Account.objects.filter(user=user)
+        user_id = self.request.user.id
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM banking_account WHERE user_id = %s", [user_id])
+            rows = cursor.fetchall()
+            accounts = [dict(zip([column[0] for column in cursor.description], row)) for row in rows]
+        return accounts
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        user_id = self.request.user.id
+        account_data = serializer.validated_data
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO banking_account (name, balance, type, account_number, user_id) VALUES (%s, %s, %s, %s, %s)",
+                [account_data['name'], account_data['balance'], account_data['type'], account_data['account_number'], user_id]
+            )
+
 
 
 class TransactionViewSet(viewsets.ViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def list(self, request):
-        user_accounts = Account.objects.filter(user=self.request.user)
-        user_transactions = Transaction.objects.filter(
-            Q(from_account__in=user_accounts) | Q(to_account__in=user_accounts)
-        )
-        serializer = TransactionSerializer(user_transactions, many=True)
+        user_id = self.request.user.id
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT * FROM banking_transaction 
+                WHERE from_account_id IN (SELECT id FROM banking_account WHERE user_id = %s)
+                OR to_account_id IN (SELECT id FROM banking_account WHERE user_id = %s)
+            """, [user_id, user_id])
+            rows = cursor.fetchall()
+            transactions = [dict(zip([column[0] for column in cursor.description], row)) for row in rows]
+
+        transaction_instances = [Transaction(**transaction) for transaction in transactions]
+        serializer = TransactionSerializer(transaction_instances, many=True)
         return Response(serializer.data)
 
+    @action(detail=False, methods=['get'], url_path='generate_statement')
+    def generate_statement(self, request):
+        user_id = self.request.user.id
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT t.id, t.date, t.amount, t.transaction_type, t.description,
+                       fa.account_number as from_account_number,
+                       ta.account_number as to_account_number, t.internal
+                FROM banking_transaction t
+                LEFT JOIN banking_account fa ON t.from_account_id = fa.id
+                LEFT JOIN banking_account ta ON t.to_account_id = ta.id
+                WHERE fa.user_id = %s OR ta.user_id = %s
+                ORDER BY t.date DESC
+            """, [user_id, user_id])
+            rows = cursor.fetchall()
+            transactions = [dict(zip([column[0] for column in cursor.description], row)) for row in rows]
+
+        # Create a PDF buffer
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        elements = []
+
+        # Add title
+        styles = getSampleStyleSheet()
+        title = Paragraph("Transaction Statement", styles['Title'])
+        elements.append(title)
+
+        # Prepare table data
+        headers = ["ID", "Date", "Amount", "Type", "Description", "From Account", "To Account", "Internal"]
+        data = [headers] + [[
+            str(transaction['id']),
+            str(transaction['date']),
+            str(transaction['amount']),
+            str(transaction['transaction_type']),
+            str(transaction['description']),
+            str(transaction['from_account_number']),
+            str(transaction['to_account_number']),
+            str(transaction['internal'])
+        ] for transaction in transactions]
+
+        # Create table
+        table = Table(data)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ]))
+
+        # Add table to elements
+        elements.append(table)
+
+        # Build PDF
+        doc.build(elements)
+
+        buffer.seek(0)
+        response = HttpResponse(buffer, content_type='application/pdf')
+        response['Content-Disposition'] = 'attachment; filename="transaction_statement.pdf"'
+        return response
+    
     @action(detail=False, methods=['get'], url_path='transactions_account')
     def transactions_account(self, request):
-        """
-        Возвращает список транзакций для заданного номера счета account_number.
-        """
         account_number = request.query_params.get('account_number')
         if not account_number:
             raise NotFound("Account number must be provided.")
-
 
         try:
             account_number = int(account_number)
         except ValueError:
             raise NotFound("Account number must be a valid number.")
 
-        account = get_object_or_404(Account, account_number=account_number, user=request.user)
-        transactions = Transaction.objects.filter(
-            Q(from_account=account) | Q(to_account=account)
-        ).order_by('-date')
-        serializer = TransactionSerializer(transactions, many=True)
+        user_id = self.request.user.id
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT * FROM banking_transaction 
+                WHERE (from_account_id = (SELECT id FROM banking_account WHERE account_number = %s AND user_id = %s) 
+                OR to_account_id = (SELECT id FROM banking_account WHERE account_number = %s AND user_id = %s))
+                ORDER BY date DESC
+            """, [account_number, user_id, account_number, user_id])
+            rows = cursor.fetchall()
+            transactions = [dict(zip([column[0] for column in cursor.description], row)) for row in rows]
+
+        transaction_instances = [Transaction(**transaction) for transaction in transactions]
+        serializer = TransactionSerializer(transaction_instances, many=True)
         return Response(serializer.data)
 
     @action(detail=False, methods=['get'])
     def last_transactions(self, request):
-        """
-               Возвращает последние 5 транзакций
-               """
-        user = self.request.user
-        user_transactions = Transaction.objects.filter(
-            Q(from_account__user=user) | Q(to_account__user=user)
-        ).order_by('-date')[:5]
+        user_id = self.request.user.id
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT * FROM banking_transaction 
+                WHERE from_account_id IN (SELECT id FROM banking_account WHERE user_id = %s)
+                OR to_account_id IN (SELECT id FROM banking_account WHERE user_id = %s)
+                ORDER BY date DESC LIMIT 5
+            """, [user_id, user_id])
+            rows = cursor.fetchall()
+            transactions = [dict(zip([column[0] for column in cursor.description], row)) for row in rows]
 
-        serializer = TransactionSerializer(user_transactions, many=True)
+        transaction_instances = [Transaction(**transaction) for transaction in transactions]
+        serializer = TransactionSerializer(transaction_instances, many=True)
         return Response(serializer.data)
 
     def create(self, request):
-        """
-                      Создает из 1 транзакции две Deposit/Withdrawal
-                       """
         serializer = TransactionSerializer(data=request.data)
         if serializer.is_valid():
             transaction_data = serializer.validated_data
             amount = transaction_data.get('amount')
-            from_account_number = transaction_data.get('from_account')
-            to_account_number = transaction_data.get('to_account')
+            from_account_number = transaction_data.get('from_account').account_number
+            to_account_number = transaction_data.get('to_account').account_number
 
-            from_account = Account.objects.get(account_number=from_account_number.account_number)
-            to_account = Account.objects.get(account_number=to_account_number.account_number)
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT id, balance, user_id FROM banking_account WHERE account_number = %s", [from_account_number])
+                from_account = cursor.fetchone()
 
-            if from_account.user != self.request.user or to_account==from_account:
-                return Response({'error': 'You do not have permission to perform this action'},
-                                status=status.HTTP_403_FORBIDDEN)
+                cursor.execute("SELECT id, balance, user_id FROM banking_account WHERE account_number = %s", [to_account_number])
+                to_account = cursor.fetchone()
 
-            if from_account.balance < amount:
-                return Response({"error": "Insufficient funds."}, status=status.HTTP_400_BAD_REQUEST)
+                if from_account[2] != self.request.user.id or from_account == to_account:
+                    return Response({'error': 'You do not have permission to perform this action'}, status=status.HTTP_403_FORBIDDEN)
 
-            internal = from_account.user == to_account.user
+                if from_account[1] < amount:
+                    return Response({"error": "Insufficient funds."}, status=status.HTTP_400_BAD_REQUEST)
 
-            with transaction.atomic():
+                internal = from_account[2] == to_account[2]
 
-                from_account.balance -= amount
-                from_account.save()
-                withdrawal_transaction = Transaction.objects.create(
-                    amount=amount,
-                    transaction_type='withdrawal',
-                    description=transaction_data.get('description'),
-                    internal=internal,
-                    from_account=from_account
-                )
+                with transaction.atomic():
+                    cursor.execute("UPDATE banking_account SET balance = balance - %s WHERE id = %s", [amount, from_account[0]])
+                    cursor.execute("""
+                        INSERT INTO banking_transaction 
+                        (amount, transaction_type, description, internal, from_account_id, date) 
+                        VALUES (%s, 'withdrawal', %s, %s, %s, CURRENT_TIMESTAMP)
+                    """, [amount, transaction_data.get('description'), internal, from_account[0]])
 
-                to_account.balance += amount
-                to_account.save()
-                deposit_transaction = Transaction.objects.create(
-                    amount=amount,
-                    transaction_type='deposit',
-                    description=transaction_data.get('description'),
-                    internal=internal,
-                    to_account=to_account
-                )
+                    cursor.execute("UPDATE banking_account SET balance = balance + %s WHERE id = %s", [amount, to_account[0]])
+                    cursor.execute("""
+                        INSERT INTO banking_transaction 
+                        (amount, transaction_type, description, internal, to_account_id, date) 
+                        VALUES (%s, 'deposit', %s, %s, %s, CURRENT_TIMESTAMP)
+                    """, [amount, transaction_data.get('description'), internal, to_account[0]])
 
-            return Response({
-                "withdrawal_transaction": TransactionSerializer(withdrawal_transaction).data,
-                "deposit_transaction": TransactionSerializer(deposit_transaction).data
-            }, status=status.HTTP_201_CREATED)
+            return Response({"success": "Transaction created successfully"}, status=status.HTTP_201_CREATED)
         else:
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
