@@ -8,7 +8,7 @@ from SimpleBanking import settings
 class User(AbstractUser):
     first_name = models.CharField(max_length=150)
     last_name = models.CharField(max_length=150)
-    date_of_birth = models.DateField()
+    date_of_birth = models.DateField(default='1970-01-01')
 
     groups = models.ManyToManyField(
         Group,
@@ -31,13 +31,9 @@ class User(AbstractUser):
 class Account(models.Model):
     SAVINGS = 'savings'
     CHECKING = 'checking'
-    LOAN = 'loan'
-    CREDIT_CARD = 'credit_card'
     ACCOUNT_TYPES = [
         (SAVINGS, 'Savings'),
         (CHECKING, 'Checking'),
-        (LOAN, 'Loan'),
-        (CREDIT_CARD, 'Credit Card'),
     ]
 
     id = models.AutoField(primary_key=True)
@@ -77,7 +73,7 @@ class Transaction(models.Model):
     date = models.DateTimeField(auto_now_add=True)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     transaction_type = models.CharField(max_length=10, choices=TRANSACTION_TYPES)
-    description = models.CharField(max_length=255, blank=True, null=True)
+    description = models.CharField(max_length=25, blank=True, null=True)
     internal = models.BooleanField(default=False)
 
     from_account = models.ForeignKey(
