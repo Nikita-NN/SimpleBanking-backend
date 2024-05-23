@@ -37,16 +37,16 @@ def generate_random_users_and_accounts(num_users=100, output_file='user_credenti
                     name=faker.word().capitalize() + ' Account',
                     balance=round(random.uniform(1000, 100000), 2),
                     type=random.choice([Account.SAVINGS, Account.CHECKING]),
-                    account_number=faker.unique.random_number(digits=10),
+                    account_number=faker.unique.random_number(digits=9),
                     user=user
                 )
-
 
                 for _ in range(random.randint(5, 10)):
                     transaction_type = random.choice(
                         [Transaction.DEPOSIT, Transaction.WITHDRAWAL, Transaction.TRANSFER])
                     amount = round(random.uniform(100, 10000), 2)
                     description = faker.text(max_nb_chars=25)
+                    date = faker.date_time_this_year().strftime('%Y-%m-%d %H:%M:%S')
 
                     Transaction.objects.create(
                         amount=amount,
@@ -55,8 +55,9 @@ def generate_random_users_and_accounts(num_users=100, output_file='user_credenti
                         from_account=account if transaction_type != Transaction.DEPOSIT else None,
                         to_account=account if transaction_type != Transaction.WITHDRAWAL else None,
                         internal=random.choice([True, False]),
+                        date=date
                     )
 
 
 if __name__ == '__main__':
-    generate_random_users_and_accounts(num_users=10)
+    generate_random_users_and_accounts(num_users=100)

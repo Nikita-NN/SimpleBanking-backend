@@ -16,7 +16,7 @@ from rest_framework.exceptions import NotFound
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-
+from datetime import datetime
 from .models import User, Transaction
 from .serializers import UserSerializer, AccountSerializer, TransactionSerializer
 
@@ -172,11 +172,11 @@ class TransactionViewSet(viewsets.ViewSet):
         title = Paragraph("Transaction Statement", styles['Title'])
         elements.append(title)
 
-        # Prepare table data
         headers = ["ID", "Date", "Amount", "Type", "Description", "From Account", "To Account", "Internal"]
         data = [headers] + [[
             str(transaction['id']),
-            str(transaction['date']),
+            transaction['date'].strftime('%Y-%m-%d %H:%M:%S') if isinstance(transaction['date'], datetime) else str(
+                transaction['date']),
             str(transaction['amount']),
             str(transaction['transaction_type']),
             str(transaction['description']),

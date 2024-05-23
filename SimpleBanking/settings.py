@@ -25,11 +25,15 @@ SECRET_KEY = 'django-insecure-q8#drg#3yzirivtx%pty)+h*2$i_f2tgnqbe5_n**+(%_6$@87
 DEBUG = True
 CORS_ALLOW_CREDENTIALS = True
 CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:5173"
+    "http://simplebanking-frontend-1",
+    "http://localhost",
+    "http://89.23.103.53"
 ]
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
 
+CORS_ALLOWED_ORIGINS = [
+    "http://simplebanking-frontend-1",
+    "http://localhost",
+    "http://89.23.103.53"
 ]
 ALLOWED_HOSTS = ["*"]
 
